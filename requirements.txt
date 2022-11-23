@@ -1,0 +1,12 @@
+torch
+torchvision
+imageio
+opencv-python
+tensorboard
+numpy
+scipy
+scikit-image
+tqdm
+lpips
+pycocotools
+pytorch-fid
