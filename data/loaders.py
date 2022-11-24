@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import torch
 import torch.nn.functional as F
+import numpy as np
 from data import datasets
 from tqdm import tqdm
 
@@ -117,6 +119,8 @@ def override_default_args(args):
 
     if args.dataset.startswith('shapenet'):
         args.inv_use_testset = True
+        # We disable pose fine-tuning due to the novel view evaluation
+        args.inv_no_optimize_pose = True 
 
 
 def get_dataset_loaders():

@@ -21,6 +21,7 @@ from models import segformer
 class BootstrapEncoder(nn.Module):
 
     def __init__(self,
+                 latent_dim,
                  pose_regressor=True,
                  latent_regressor=True,
                  separate_backbones=False,
@@ -62,7 +63,7 @@ class BootstrapEncoder(nn.Module):
             self.w_regressor_post = nn.Sequential(
                 nn.Linear(512, 512),
                 nn.ReLU(inplace=True),
-                nn.Linear(512, args.latent_dim),
+                nn.Linear(512, latent_dim),
                 nn.LeakyReLU(0.2)  # Same as mapping network
             )
 

@@ -180,6 +180,9 @@ def parse_args():
     parser.add_argument('--inv_train_coord_only',
                         action='store_true',
                         help='Exit after training encoder')
+    parser.add_argument('--inv_encoder_only',
+                        action='store_true',
+                        help='Do not apply inversion (show result with N=0)')
 
     # Coord regressor params
     parser.add_argument('--coord_resume_from', type=str)

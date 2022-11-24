@@ -126,8 +126,9 @@ else:
 
 if resume_from is not None:
     print('Checkpoint iteration:', resume_from['iteration'])
-    print('Checkpoint FID:', resume_from['fid_untrunc'])
-    print('Checkpoint FID (best):', resume_from['best_fid'])
+    if 'fid_untrunc' in resume_from:
+        print('Checkpoint unconditional FID:', resume_from['fid_untrunc'])
+        print('Checkpoint unconditional FID (best):', resume_from['best_fid'])
 
 if args.attention_values > 0:
     color_palette = utils.get_color_palette(args.attention_values).to(device)
@@ -404,9 +405,7 @@ else:
         remaining = n_images_fid
         train_eval_split.eval_indices = []
         while remaining > 0:
-            nimg = len(
-                train_split.images) // 2 if dataset.add_mirrored else len(
-                    train_split.images)
+            nimg = len(train_eval_split.images)
             train_eval_split.eval_indices.append(
                 torch.randperm(nimg, generator=random_generator)[:remaining])
             remaining -= len(train_eval_split.eval_indices[-1])
@@ -1527,6 +1526,7 @@ def train_coord_regressor(writer):
 
     # Train from scratch
     coord_regressor = encoder.BootstrapEncoder(
+        args.latent_dim,
         pose_regressor=regress_pose,
         latent_regressor=regress_latent,
         separate_backbones=regress_separate,
@@ -1571,13 +1571,15 @@ def train_coord_regressor(writer):
                              'rb') as f:
             checkpoint = torch.load(f, map_location='cpu')
             coord_regressor.load_state_dict(checkpoint['model_coord'])
-            optimizer_coord.load_state_dict(checkpoint['optimizer_coord'])
+            if 'optimizer_coord' in checkpoint:
+                optimizer_coord.load_state_dict(checkpoint['optimizer_coord'])
             lr = checkpoint['lr']
             for param_group in optimizer_coord.param_groups:
                 param_group['lr'] = lr
             i = checkpoint['iteration']
-            utils.restore_random_state(checkpoint['random_state'],
-                                       train_sampler, rng, gpu_ids)
+            if 'random_state' in checkpoint:
+                utils.restore_random_state(checkpoint['random_state'],
+                                           train_sampler, rng, gpu_ids)
         print(f'Resuming from iteration {i}...')
 
     def criterion_coords(pred, target, mask):
@@ -1740,7 +1742,7 @@ if args.run_inversion:
         mode_str += '_optpose'
     w_split_str = 'nosplit' if inv_no_split else 'split'
     cfg_xid = f'_{args.xid}' if len(args.xid) > 0 else ''
-    cfg_string = f'i{cfg_xid}_{split_str}_{mode_str}_{loss_to_use}_gain{lr_gain_z}_{w_split_str}'
+    cfg_string = f'i{cfg_xid}_{split_str}{mode_str}_{loss_to_use}_gain{lr_gain_z}_{w_split_str}'
     cfg_string += f'_it{resume_from["iteration"]}'
 
     print('Config string:', cfg_string)
@@ -1755,6 +1757,7 @@ if args.run_inversion:
         if args.coord_resume_from:
             print('Resuming from pose regressor', args.coord_resume_from)
             coord_regressor = encoder.BootstrapEncoder(
+                args.latent_dim,
                 pose_regressor=use_pose_regressor,
                 latent_regressor=use_latent_regressor,
                 separate_backbones=args.inv_use_separate,
@@ -1762,6 +1765,7 @@ if args.run_inversion:
 
             coord_regressor = nn.DataParallel(coord_regressor, gpu_ids)
             checkpoint_path = os.path.join(args.root_path, 'coords_checkpoints',
+                                           args.resume_from,
                                            f'{args.coord_resume_from}.pth')
             with utils.open_file(checkpoint_path, 'rb') as f:
                 coord_regressor.load_state_dict(
@@ -1781,7 +1785,12 @@ if args.run_inversion:
     image_indices = test_split.eval_indices if use_testset else train_eval_split.eval_indices
     image_indices_perm = test_split.eval_indices_perm if use_testset else train_eval_split.eval_indices_perm
 
-    checkpoint_steps = [0, 30]
+    if args.inv_encoder_only:
+        checkpoint_steps = [0]
+    elif lr_gain_z >= 10:
+        checkpoint_steps = [0, 10]
+    else:
+        checkpoint_steps = [0, 30]
 
     report = {
         step: {
@@ -1812,16 +1821,17 @@ if args.run_inversion:
     report_checkpoint_path = os.path.join(report_dir_effective,
                                           'report_checkpoint.pth')
     if utils.file_exists(report_checkpoint_path):
-        print('Found report checkpoint in', report_checkpoint_path)
+        print('Found inversion report checkpoint in', report_checkpoint_path)
         with utils.open_file(report_checkpoint_path, 'rb') as f:
             report_checkpoint = torch.load(f)
             report = report_checkpoint['report']
             idx = report_checkpoint['idx']
             test_bs = report_checkpoint['test_bs']
     else:
-        print('Report checkpoint not found, starting from scratch...')
+        print('Inversion report checkpoint not found, starting from scratch...')
 
     while idx < len(image_indices):
+        t1 = time.time()
         frames = []
 
         if test_bs != 1 and image_indices[idx:idx + test_bs].shape[0] < test_bs:
@@ -2016,8 +2026,10 @@ if args.run_inversion:
                 torch.FloatTensor(
                     fid.forward_inception_batch(
                         inception_net, rgb_predicted_perm[:, :3] / 2 + 0.5)))
-            item['rot_error'].append(
-                pose_utils.rotation_matrix_distance(cam, gt_cam2world_mat))
+            if not (args.dataset == 'p3d_car' and use_testset):
+                # Ground-truth poses are not available on P3D Car (test set)
+                item['rot_error'].append(
+                    pose_utils.rotation_matrix_distance(cam, gt_cam2world_mat))
 
             if writer is not None and idx == 0:
                 if it == checkpoint_steps[0]:
@@ -2148,7 +2160,6 @@ if args.run_inversion:
 
             return loss, psnr_monitor, lpips_monitor, rgb_predicted
 
-        t1 = time.time()
         for it in range(niter):
             cam, focal = pose_utils.pose_to_matrix(
                 z0_,
@@ -2211,7 +2222,7 @@ if args.run_inversion:
         t2 = time.time()
         idx += test_bs
         print(
-            f'[{idx}/{len(image_indices)}] Finished batch in {t2-t1} ({(t2-t1)/test_bs} s/img)'
+            f'[{idx}/{len(image_indices)}] Finished batch in {t2-t1} s ({(t2-t1)/test_bs} s/img)'
         )
 
         if idx % 512 == 0:
@@ -2231,6 +2242,14 @@ if args.run_inversion:
             else:
                 report_entry[k] = torch.cat(v, dim=0)
 
+    print()
+    print('Useful information:')
+    print('psnr_random: PSNR evaluated on novel views (in the test set, if available)')
+    print('ssim_random: SSIM evaluated on novel views (in the test set, if available)')
+    print('rot_error: rotation error in degrees (only reliable on synthetic datasets)')
+    print('fid_random: FID of selected split, evaluated against stats of train split')
+    print('fid_random_test: FID of selected split, evaluated against stats of test split')
+    print()
     report_str_full = ''
     for iter_num, report_entry in report.items():
         report_str = f'[{iter_num} iterations]'
@@ -2268,10 +2287,6 @@ if args.run_inversion:
         add_inception_report('inception_activations_front', 'fid_front')
         fid_value = add_inception_report('inception_activations_random',
                                          'fid_random')
-
-        psnr_over_fid = report_entry['psnr_avg'] / fid_value
-        writer.add_scalar('report/psnr_over_fid', psnr_over_fid, iter_num)
-        report_str += f' psnr_over_fid {psnr_over_fid:.03f}'
 
         print(report_str)
         report_str_full += report_str + '\n'
