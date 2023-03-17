@@ -113,6 +113,53 @@ def restore_random_state(rng_state, data_sampler, rng, gpu_ids):
     data_sampler.set_state(rng_state['data_sampler_state'], rng)
 
 
+def load_manual_image(path_or_url, coco_class_id):
+    # On-demand imports
+    import urllib
+    import PIL
+    import detectron2
+    import detectron2.config
+    import detectron2.model_zoo
+    import detectron2.engine
+
+    if path_or_url.startswith('http'):
+        with urllib.request.urlopen(path_or_url) as response:
+            demo_input_img = PIL.Image.open(io.BytesIO(response.read()))
+    else:
+        demo_input_img = PIL.Image.open(path_or_url)
+    demo_input_img = np.array(demo_input_img)
+    assert len(demo_input_img.shape) == 3
+    assert demo_input_img.shape[-1] in [3, 4] # RGB(A)
+    demo_input_img = demo_input_img[:, :, :3]
+
+    # In the paper we use PointRend to extract masks,
+    # but for a demo a simpler model is also fine.
+    # cfg_file = 'COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml'
+    cfg_file = 'COCO-InstanceSegmentation/mask_rcnn_X_101_32x8d_FPN_3x.yaml'
+
+    cfg = detectron2.config.get_cfg()
+    cfg.merge_from_file(detectron2.model_zoo.get_config_file(cfg_file))
+    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5 # Detection threshold
+    cfg.MODEL.WEIGHTS = detectron2.model_zoo.get_checkpoint_url(cfg_file)
+    predictor = detectron2.engine.DefaultPredictor(cfg)
+
+    # Detectron expects BGR format
+    outputs = predictor(demo_input_img[:, :, ::-1])['instances']
+    outputs = outputs[outputs.pred_classes == coco_class_id]
+    if len(outputs) == 0:
+        raise RuntimeError('Could not detect any object in the provided image')
+    
+    # Extract largest detected object
+    outputs = outputs[outputs.pred_masks.sum(dim=[1, 2]).argmax().item()]
+
+    manual_image = {
+        'image': demo_input_img.astype(np.float32) / 255,
+        'mask': outputs.pred_masks[0].cpu().float().unsqueeze(-1),
+        'bbox': outputs.pred_boxes.tensor[0].cpu().tolist(),
+    }
+    return manual_image
+
+
 class EndlessSampler:
 
     def __init__(self, dataset_size, rng):

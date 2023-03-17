@@ -137,6 +137,17 @@ def get_dataset_loaders():
         'imagenet_elephant': load_custom,
     }
 
+def get_coco_mapping():
+    return {
+        'p3d_car': 2,
+        'cub': 14,
+        'imagenet_car': 2,
+        'imagenet_airplane': 4,
+        'imagenet_motorcycle': 3,
+        'imagenet_zebra': 22,
+        'imagenet_elephant': 20,
+    }
+
 
 class DatasetSplitView:
 
@@ -199,17 +210,33 @@ def autodetect_dataset(experiment_name):
         )
 
 
-def load_dataset(args, device):
+def load_dataset(args, device, manual_image=None):
     override_default_args(args)
     dataset_config = get_dataset_config(args.dataset)
     loader = get_dataset_loaders()[args.dataset]
+    if manual_image is not None:
+        extra_kwargs = {'manual_image': manual_image}
+        args.augment_p = 0
+    else:
+        extra_kwargs = {}
     train_split, train_eval_split, test_split = loader(dataset_config, args,
-                                                       device)
+                                                       device, **extra_kwargs)
 
     return dataset_config, train_split, train_eval_split, test_split
 
 
-def load_custom(dataset_config, args, device):
+def insert_manual_image(dataset, split, manual_image):
+    img, mask, _, _, _, _, _, bbox, _ = dataset.forward_img(None, manual_image)
+    mask = mask[None, :, :]
+    img = img * 2 - 1
+    img *= mask
+    img = np.concatenate((img, mask), axis=0)
+    img = torch.FloatTensor(img).permute(1, 2, 0)
+    split.images[0] = img
+    if split.bbox[0] is not None and split.bbox[0].shape[-1] == 4:
+        split.bbox[0] = torch.FloatTensor(bbox)
+
+def load_custom(dataset_config, args, device, manual_image=None):
     if args.dataset.startswith('p3d_') or args.dataset.startswith('imagenet_'):
         dataset_inst = lambda *fn_args, **fn_kwargs: datasets.CustomDataset(
             args.dataset, *fn_args, **fn_kwargs, root_dir=args.data_path)
@@ -281,17 +308,18 @@ def load_custom(dataset_config, args, device):
                 F.avg_pool2d(sample['img'], 2).clamp(-1, 1).permute(0, 2, 3, 1))
         else:
             all_images.append(sample['img'].clamp(-1, 1).permute(0, 2, 3, 1))
-        all_poses.append(sample['pose'])
-        all_focal.append(sample['focal'])
-        all_bbox.append(sample['normalized_bbox'])
-        all_classes.append(sample['class'])
+        # We clone the tensors to avoid issues with shared memory
+        all_poses.append(sample['pose'].clone())
+        all_focal.append(sample['focal'].clone())
+        all_bbox.append(sample['normalized_bbox'].clone())
+        all_classes.append(sample['class'].clone())
 
     for i, sample in enumerate(tqdm(loader_fid)):
         all_images_fid.append(sample['img'].clamp(-1, 1).permute(0, 2, 3, 1))
-        all_poses_fid.append(sample['pose'])
-        all_focal_fid.append(sample['focal'])
-        all_bbox_fid.append(sample['normalized_bbox'])
-        all_classes_fid.append(sample['class'])
+        all_poses_fid.append(sample['pose'].clone())
+        all_focal_fid.append(sample['focal'].clone())
+        all_bbox_fid.append(sample['normalized_bbox'].clone())
+        all_classes_fid.append(sample['class'].clone())
 
     if dataset_config['views_per_object_test'] and (args.use_encoder or
                                                     args.run_inversion):
@@ -302,14 +330,18 @@ def load_custom(dataset_config, args, device):
         for i, sample in enumerate(tqdm(loader_test)):
             all_images_test.append(sample['img'].clamp(-1,
                                                        1).permute(0, 2, 3, 1))
-            all_poses_test.append(sample['pose'])
-            all_focal_test.append(sample['focal'])
-            all_bbox_test.append(sample['normalized_bbox'])
+            all_poses_test.append(sample['pose'].clone())
+            all_focal_test.append(sample['focal'].clone())
+            all_bbox_test.append(sample['normalized_bbox'].clone())
         test_split.images = torch.cat(all_images_test, dim=0)
         test_split.tform_cam2world = torch.cat(all_poses_test, dim=0)
         test_split.focal_length = torch.cat(all_focal_test, dim=0).squeeze(1)
         test_split.bbox = torch.cat(all_bbox_test, dim=0)
         print('Loaded test split with shape', test_split.images.shape)
+
+        if manual_image is not None:
+            # Replace first image with supplied image (demo inference)
+            insert_manual_image(dataset_test, test_split, manual_image)
 
     train_split.images = torch.cat(all_images, dim=0)
     train_eval_split.images = torch.cat(all_images_fid, dim=0)
@@ -323,12 +355,18 @@ def load_custom(dataset_config, args, device):
     train_split.bbox = torch.cat(all_bbox, dim=0)
     train_split.classes = torch.cat(all_classes, dim=0)
     train_split.num_classes = train_split.classes.max().item() + 1
+    if manual_image is not None:
+        # Replace first image with supplied image (demo inference)
+        insert_manual_image(dataset, train_split, manual_image)
 
     train_eval_split.tform_cam2world = torch.cat(all_poses_fid, dim=0)
     train_eval_split.focal_length = torch.cat(all_focal_fid, dim=0).squeeze(1)
     train_eval_split.bbox = torch.cat(all_bbox_fid, dim=0)
     train_eval_split.classes = torch.cat(all_classes_fid, dim=0)
     train_eval_split.num_classes = train_split.num_classes
+    if manual_image is not None:
+        # Replace first image with supplied image (demo inference)
+        insert_manual_image(dataset_fid, train_eval_split, manual_image)
 
     if args.dataset == 'cub':
         # Ortho camera

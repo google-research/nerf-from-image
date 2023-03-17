@@ -259,33 +259,47 @@ class CustomDataset(torch.utils.data.Dataset):
         else:
             return img_flip, mask_flip, sfm_pose
 
-    def forward_img(self, idx):
-        idx_ = idx
-        if self.add_mirrored and idx >= len(self.detections):
-            idx_ -= len(self.detections)
-            mirrored = True
+    def forward_img(self, idx, manual_image=None):
+        if manual_image is None:
+            idx_ = idx
+            if self.add_mirrored and idx >= len(self.detections):
+                idx_ -= len(self.detections)
+                mirrored = True
+            else:
+                mirrored = False
+            item = self.detections[idx_]
+
+            img_path_rel = os.path.join(self.root_dir,
+                                        item['image_path'].replace('datasets/', ''))
+            img_path = img_path_rel
+            mask = pycocotools.mask.decode(item['mask'])
+            bbox = item['bbox'].flatten()
+
+            img = skimage.io.imread(img_path) / 255.0
+            # Some are grayscale:
+            if len(img.shape) == 2:
+                img = np.repeat(np.expand_dims(img, 2), 3, axis=2)
+            mask = np.expand_dims(mask, 2)
+
+            # Sfm pose layout:
+            # Focal, Translation xyz, Rot
+            sfm_pose = [
+                self.poses['f'][idx_].numpy(), self.poses['t'][idx_].numpy(),
+                self.poses['R'][idx_].numpy()
+            ]
         else:
+            img = manual_image['image']
+            mask = manual_image['mask']
+            bbox = manual_image['bbox']
             mirrored = False
-        item = self.detections[idx_]
+            img_path_rel = ''
 
-        img_path_rel = os.path.join(self.root_dir,
-                                    item['image_path'].replace('datasets/', ''))
-        img_path = img_path_rel
-        mask = pycocotools.mask.decode(item['mask'])
-        bbox = item['bbox'].flatten()
-
-        img = skimage.io.imread(img_path) / 255.0
-        # Some are grayscale:
-        if len(img.shape) == 2:
-            img = np.repeat(np.expand_dims(img, 2), 3, axis=2)
-        mask = np.expand_dims(mask, 2)
-
-        # Sfm pose layout:
-        # Focal, Translation xyz, Rot
-        sfm_pose = [
-            self.poses['f'][idx_].numpy(), self.poses['t'][idx_].numpy(),
-            self.poses['R'][idx_].numpy()
-        ]
+            # Dummy pose
+            sfm_pose = [
+                np.zeros((1,), dtype=np.float32),
+                np.zeros((3,), dtype=np.float32),
+                np.zeros((4,), dtype=np.float32),
+            ]
 
         crop = self.crop  # ImageNet / P3D
 
@@ -464,7 +478,10 @@ class CUBDataset(CustomDataset):
         sfm_pose[1][1] = 2.0 * (sfm_pose[1][1] / img_h) - 1
         return sfm_pose
 
-    def forward_img(self, idx):
+    def forward_img(self, idx, manual_image=None):
+        if manual_image is not None:
+            return super().forward_img(idx, manual_image)
+
         idx_ = idx
         if self.add_mirrored and idx >= len(self.anno):
             idx_ -= len(self.anno)

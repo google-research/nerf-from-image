@@ -61,7 +61,7 @@ def ssim(pred, target, reduction='mean'):
             skimage.metrics.structural_similarity(pred,
                                                   target,
                                                   channel_axis=0,
-                                                  range=1.)
+                                                  data_range=1.)
         ]).to(device)
     else:
         pred = pred.cpu().numpy()
@@ -72,7 +72,7 @@ def ssim(pred, target, reduction='mean'):
                 skimage.metrics.structural_similarity(pred_elem,
                                                       target_elem,
                                                       channel_axis=0,
-                                                      range=1.))
+                                                      data_range=1.))
         return torch.FloatTensor(similarities).to(device)
 
 

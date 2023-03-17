@@ -40,8 +40,9 @@ def quaternion_rotate_vector(q, v):
 
 def quaternion_to_matrix(q):
     """Converts a unit quaternion to a rotation matrix."""
-    return quaternion_rotate_vector(q,
-                                    torch.eye(3, device=q.device).unsqueeze(0))
+    return quaternion_rotate_vector(
+        q,
+        torch.eye(3, device=q.device).unsqueeze(0).expand(q.shape[0], -1, -1))
 
 
 def pose_to_matrix(z0, t2, s, q, camera_flipped: bool):

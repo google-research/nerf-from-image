@@ -171,6 +171,9 @@ def parse_args():
                         type=int,
                         default=5,
                         help='Gain to use for inversion')
+    parser.add_argument('--inv_steps',
+                        type=int,
+                        help='Specify max number of inversion steps manually')
     parser.add_argument('--inv_no_split',
                         action='store_true',
                         help='Do not split latent code for inversion')
@@ -183,6 +186,13 @@ def parse_args():
     parser.add_argument('--inv_encoder_only',
                         action='store_true',
                         help='Do not apply inversion (show result with N=0)')
+    parser.add_argument('--inv_export_demo_sample',
+                        action='store_true',
+                        help='Export demo image on the first batch')
+    parser.add_argument('--inv_manual_input_path',
+                        type=str,
+                        help='Path or URL for demo inference')
+    
 
     # Coord regressor params
     parser.add_argument('--coord_resume_from', type=str)
