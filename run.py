@@ -16,6 +16,7 @@ import os
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torchvision
 import matplotlib.pyplot as plt
 import time
 import sys
@@ -39,6 +40,15 @@ from models import discriminator
 from models import encoder
 
 args = arguments.parse_args()
+
+if args.inv_manual_input_path:
+    # Demo inference on externally supplied image
+    args.gpus = 1 if args.gpus >= 1 else 0
+    args.inv_export_demo_sample = True
+
+if args.inv_export_demo_sample:
+    args.run_inversion = True
+
 gpu_ids = list(range(args.gpus))
 
 if args.gpus > 0 and torch.cuda.is_available():
@@ -48,13 +58,21 @@ else:
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
-torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
 
 if args.dataset == 'autodetect':
     assert args.resume_from
     args.dataset = loaders.autodetect_dataset(args.resume_from)
 
 print(args)
+
+if args.inv_manual_input_path:
+    # Load external image for demo inference
+    manual_image = utils.load_manual_image(
+        args.inv_manual_input_path,
+        loaders.get_coco_mapping()[args.dataset])
+else:
+    manual_image = None
+
 
 experiment_name = arguments.suggest_experiment_name(args)
 resume_from = None
@@ -135,8 +153,9 @@ if args.attention_values > 0:
 else:
     color_palette = None
 
+print('Loading data...')
 dataset_config, train_split, train_eval_split, test_split = loaders.load_dataset(
-    args, device)
+    args, device, manual_image)
 
 if args.perturb_poses > 0:
     print('Perturbing poses', args.perturb_poses)
@@ -362,8 +381,6 @@ evaluation_res = args.resolution
 inception_net = fid.init_inception('tensorflow').to(device).eval()
 
 # Compute stats
-print('Computing FID stats...')
-
 
 def compute_real_fid_stats(images_fid_actual):
     n_images_fid = len(images_fid_actual)
@@ -382,13 +399,16 @@ def compute_real_fid_stats(images_fid_actual):
     return fid.calculate_stats(all_activations)
 
 
-train_eval_split.fid_stats = compute_real_fid_stats(train_eval_split.images)
+if not args.inv_export_demo_sample:
+    print('Computing FID stats for training set...')
+    train_eval_split.fid_stats = compute_real_fid_stats(train_eval_split.images)
 n_images_fid = len(train_eval_split.images)
 
 if ((args.run_inversion and args.inv_use_testset) or
         args.use_encoder) and dataset_config['views_per_object_test']:
-    print('Computing FID stats for test set...')
-    test_split.fid_stats = compute_real_fid_stats(test_split.images)
+    if not args.inv_export_demo_sample:
+        print('Computing FID stats for test set...')
+        test_split.fid_stats = compute_real_fid_stats(test_split.images)
 
 random_seed = 1234
 n_images_fid_max = 8000  # Matches Pix2NeRF evaluation protocol
@@ -864,7 +884,7 @@ if resume_from is not None:
         optimizer_d.load_state_dict(resume_from['optimizer_d'])
     if 'iteration' in resume_from:
         i = resume_from['iteration']
-        print('Resuming from iteration', i)
+        print('Resuming GAN from iteration', i)
     else:
         i = args.iterations
 
@@ -1524,7 +1544,16 @@ def train_coord_regressor(writer):
         coord_regressor_checkpoint_dir, coord_regressor_experiment_name)
     print('Saving to', coord_regressor_checkpoint_path + '_latest.pth')
 
-    # Train from scratch
+    # Resume if cache is available
+    checkpoint = None
+    if utils.file_exists(coord_regressor_checkpoint_path + '_latest.pth'):
+        print(
+            f'Restoring encoder checkpoint from {coord_regressor_checkpoint_path}_latest.pth'
+        )
+        with utils.open_file(coord_regressor_checkpoint_path + '_latest.pth',
+                             'rb') as f:
+            checkpoint = torch.load(f, map_location='cpu')
+
     coord_regressor = encoder.BootstrapEncoder(
         args.latent_dim,
         pose_regressor=regress_pose,
@@ -1532,7 +1561,7 @@ def train_coord_regressor(writer):
         separate_backbones=regress_separate,
         pretrained_model_path=os.path.join(args.root_path,
                                            'coords_checkpoints'),
-        pretrained=True,
+        pretrained=checkpoint is None,
     ).to(device)
 
     coord_regressor = nn.DataParallel(coord_regressor, gpu_ids)
@@ -1563,24 +1592,18 @@ def train_coord_regressor(writer):
                 }, f)
 
     # Resume if cache is available
-    if utils.file_exists(coord_regressor_checkpoint_path + '_latest.pth'):
-        print(
-            f'Restoring checkpoint from {coord_regressor_checkpoint_path}_latest.pth'
-        )
-        with utils.open_file(coord_regressor_checkpoint_path + '_latest.pth',
-                             'rb') as f:
-            checkpoint = torch.load(f, map_location='cpu')
-            coord_regressor.load_state_dict(checkpoint['model_coord'])
-            if 'optimizer_coord' in checkpoint:
-                optimizer_coord.load_state_dict(checkpoint['optimizer_coord'])
-            lr = checkpoint['lr']
-            for param_group in optimizer_coord.param_groups:
-                param_group['lr'] = lr
-            i = checkpoint['iteration']
-            if 'random_state' in checkpoint:
-                utils.restore_random_state(checkpoint['random_state'],
-                                           train_sampler, rng, gpu_ids)
-        print(f'Resuming from iteration {i}...')
+    if checkpoint is not None:
+        coord_regressor.load_state_dict(checkpoint['model_coord'])
+        if 'optimizer_coord' in checkpoint:
+            optimizer_coord.load_state_dict(checkpoint['optimizer_coord'])
+        lr = checkpoint['lr']
+        for param_group in optimizer_coord.param_groups:
+            param_group['lr'] = lr
+        i = checkpoint['iteration']
+        if 'random_state' in checkpoint:
+            utils.restore_random_state(checkpoint['random_state'],
+                                        train_sampler, rng, gpu_ids)
+        print(f'Resuming encoder from iteration {i}...')
 
     def criterion_coords(pred, target, mask):
         # Assume channel last!
@@ -1677,7 +1700,8 @@ def train_coord_regressor(writer):
 
     coord_regressor.eval()
     coord_regressor.requires_grad_(False)
-    save_checkpoint()
+    if checkpoint is None or checkpoint['iteration'] < max_iters:
+        save_checkpoint()
 
     return coord_regressor
 
@@ -1726,7 +1750,12 @@ if args.run_inversion:
     inv_no_split = args.inv_no_split
     no_optimize_pose = args.inv_no_optimize_pose
 
-    batch_size = args.batch_size // 4 * len(gpu_ids)
+    if args.inv_manual_input_path:
+        # Demo inference on manually supplied image
+        batch_size = 1
+    else:
+        batch_size = args.batch_size // 4 * len(gpu_ids)
+
 
     if args.dataset == 'p3d_car' and use_testset:
         split_str = 'imagenettest' if args.inv_use_imagenet_testset else 'test'
@@ -1785,8 +1814,16 @@ if args.run_inversion:
     image_indices = test_split.eval_indices if use_testset else train_eval_split.eval_indices
     image_indices_perm = test_split.eval_indices_perm if use_testset else train_eval_split.eval_indices_perm
 
+    if args.inv_export_demo_sample and not args.inv_manual_input_path:
+        # Randomize order of samples
+        shuffle_idx = np.random.RandomState(1).permutation(len(image_indices))
+        image_indices = image_indices[shuffle_idx]
+        image_indices_perm = image_indices_perm[shuffle_idx]
+
     if args.inv_encoder_only:
         checkpoint_steps = [0]
+    elif args.inv_steps:
+        checkpoint_steps = [0, args.inv_steps]
     elif lr_gain_z >= 10:
         checkpoint_steps = [0, 10]
     else:
@@ -1820,16 +1857,20 @@ if args.run_inversion:
 
     report_checkpoint_path = os.path.join(report_dir_effective,
                                           'report_checkpoint.pth')
-    if utils.file_exists(report_checkpoint_path):
-        print('Found inversion report checkpoint in', report_checkpoint_path)
-        with utils.open_file(report_checkpoint_path, 'rb') as f:
-            report_checkpoint = torch.load(f)
-            report = report_checkpoint['report']
-            idx = report_checkpoint['idx']
-            test_bs = report_checkpoint['test_bs']
-    else:
-        print('Inversion report checkpoint not found, starting from scratch...')
+    if not args.inv_export_demo_sample:
+        if utils.file_exists(report_checkpoint_path):
+            print('Found inversion report checkpoint in',
+            report_checkpoint_path)
+            with utils.open_file(report_checkpoint_path, 'rb') as f:
+                report_checkpoint = torch.load(f)
+                report = report_checkpoint['report']
+                idx = report_checkpoint['idx']
+                test_bs = report_checkpoint['test_bs']
+        else:
+            print('Inversion report checkpoint not found,'
+                  ' starting from scratch...')
 
+    print('Running...')
     while idx < len(image_indices):
         t1 = time.time()
         frames = []
@@ -1877,8 +1918,11 @@ if args.run_inversion:
                 target_center_perm = test_split[target_img_idx_perm].center
                 target_bbox_perm = test_split[target_img_idx_perm].bbox
         else:
-            target_img = train_split[target_img_idx].images
-            views_per_object = dataset_config['views_per_object']
+            if not args.inv_export_demo_sample:
+                target_img = train_split[target_img_idx].images
+            else:
+                # Demo inference (use cropping)
+                target_img = train_eval_split[target_img_idx].images
 
             # Target for evaluation
             if dataset_config['camera_projection_model'] == 'ortho':
@@ -1892,8 +1936,12 @@ if args.run_inversion:
             target_focal = train_split[target_img_idx].focal_length
             target_center = None
             target_bbox = None
-            target_center_fid = train_eval_split[target_img_idx].center
-            target_bbox_fid = train_eval_split[target_img_idx].bbox
+            if not args.inv_export_demo_sample:
+                target_center_fid = train_eval_split[target_img_idx].center
+                target_bbox_fid = train_eval_split[target_img_idx].bbox
+            else:
+                target_center_fid = None
+                target_bbox_fid = None
 
             target_tform_cam2world_perm = train_eval_split[
                 target_img_idx_perm].tform_cam2world
@@ -1902,6 +1950,7 @@ if args.run_inversion:
             target_center_perm = train_eval_split[target_img_idx_perm].center
             target_bbox_perm = train_eval_split[target_img_idx_perm].bbox
 
+            views_per_object = dataset_config['views_per_object']
             if views_per_object > 1:
                 target_img_fid_random_ = train_eval_split[
                     target_img_idx_perm].images  # Cropped
@@ -1968,7 +2017,7 @@ if args.run_inversion:
         rot_errors = []
         niter = max(checkpoint_steps)
 
-        def evaluate_inversion(it):
+        def evaluate_inversion(it, export_sample=False):
             item = report[it]
             item['ws'].append(z_.detach().cpu() * lr_gain_z)
             if z0_ is not None:
@@ -2005,6 +2054,25 @@ if args.run_inversion:
                                                                 2).clamp_(
                                                                     -1, 1)
             target_perm = target_img_fid_.permute(0, 3, 1, 2)
+
+            if export_sample:
+                with torch.no_grad():
+                    demo_img = target_perm[:, :3]
+                    if use_pose_regressor and target_mask is not None:
+                        coords_img = (
+                            target_coords.permute(0, 3, 1, 2)
+                            * target_mask.unsqueeze(1))
+                        coords_img /= dataset_config['scene_range']
+                        coords_img.clamp_(-1, 1)
+                        if dataset_config['white_background']:
+                            coords_img += 1 - target_mask.unsqueeze(1)
+                        demo_img = torch.cat((demo_img, coords_img), dim=3)
+                    demo_img = torch.cat((demo_img, rgb_predicted_perm), dim=3)
+                    if normals_predicted is not None:
+                        demo_img = torch.cat(
+                            (demo_img, normals_predicted.permute(0, 3, 1, 2)),
+                            dim=3)
+
             item['psnr'].append(
                 metrics.psnr(rgb_predicted_perm[:, :3] / 2 + 0.5,
                              target_perm[:, :3] / 2 + 0.5,
@@ -2022,10 +2090,12 @@ if args.run_inversion:
                 loss_fn_lpips(rgb_predicted_perm[:, :3],
                               target_perm[:, :3],
                               normalize=False).flatten().cpu())
-            item['inception_activations_front'].append(
-                torch.FloatTensor(
-                    fid.forward_inception_batch(
-                        inception_net, rgb_predicted_perm[:, :3] / 2 + 0.5)))
+            if not args.inv_export_demo_sample:
+                item['inception_activations_front'].append(
+                    torch.FloatTensor(
+                        fid.forward_inception_batch(
+                            inception_net,
+                            rgb_predicted_perm[:, :3] / 2 + 0.5)))
             if not (args.dataset == 'p3d_car' and use_testset):
                 # Ground-truth poses are not available on P3D Car (test set)
                 item['rot_error'].append(
@@ -2068,6 +2138,25 @@ if args.run_inversion:
             )
             rgb_predicted_perm = rgb_predicted.detach().permute(0, 3, 1,
                                                                 2).clamp(-1, 1)
+            if export_sample:
+                with torch.no_grad():
+                    demo_img = torch.cat((demo_img, rgb_predicted_perm), dim=3)
+                    if normals_predicted is not None:
+                        demo_img = torch.cat(
+                            (demo_img, normals_predicted.permute(0, 3, 1, 2)),
+                            dim=3)
+                    out_dir = 'outputs'
+                    utils.mkdir(out_dir)
+                    if args.inv_manual_input_path:
+                        out_fname = f'demo_manual_{args.dataset}_{it}it.png'
+                    else:
+                        out_fname = f'sample_{args.dataset}_{it}it.png'
+                    out_path = os.path.join(out_dir, out_fname)
+                    print('Saving demo output to', out_path)
+                    torchvision.utils.save_image(demo_img/2 + 0.5,
+                                                 out_path,
+                                                 nrow=1,
+                                                 padding=0)
             if views_per_object > 1:
                 target_perm_random = target_img_fid_random_.permute(0, 3, 1, 2)
                 item['psnr_random'].append(
@@ -2082,10 +2171,12 @@ if args.run_inversion:
                     loss_fn_lpips(rgb_predicted_perm[:, :3],
                                   target_perm_random[:, :3],
                                   normalize=False).flatten().cpu())
-            item['inception_activations_random'].append(
-                torch.FloatTensor(
-                    fid.forward_inception_batch(
-                        inception_net, rgb_predicted_perm[:, :3] / 2 + 0.5)))
+            if not args.inv_export_demo_sample:
+                item['inception_activations_random'].append(
+                    torch.FloatTensor(
+                        fid.forward_inception_batch(
+                            inception_net,
+                            rgb_predicted_perm[:, :3] / 2 + 0.5)))
             if writer is not None and idx == 0:
                 writer.add_images('img/recon_random',
                                   rgb_predicted_perm.cpu() / 2 + 0.5, it)
@@ -2104,7 +2195,9 @@ if args.run_inversion:
                             0, 3, 1, 2) / 2 + 0.5, it)
 
         if 0 in checkpoint_steps:
-            evaluate_inversion(0)
+            evaluate_inversion(0,
+                               (args.inv_export_demo_sample
+                                and max(checkpoint_steps) == 0))
 
         def optimize_iter(module, rgb_predicted, acc_predicted,
                           semantics_predicted, extra_model_outputs, target_img,
@@ -2216,14 +2309,22 @@ if args.run_inversion:
                 z0_.data.clamp_(-4, 4)
             s_.data.abs_()
 
+            if args.inv_export_demo_sample:
+                print(it + 1, '/', max(checkpoint_steps))
             if it + 1 in report:
-                evaluate_inversion(it + 1)
+                evaluate_inversion(it + 1,
+                                   (args.inv_export_demo_sample
+                                    and it + 1 == max(checkpoint_steps)))
 
         t2 = time.time()
         idx += test_bs
         print(
             f'[{idx}/{len(image_indices)}] Finished batch in {t2-t1} s ({(t2-t1)/test_bs} s/img)'
         )
+
+        if args.inv_export_demo_sample:
+            # Evaluate (and save) only the first batch, then exit
+            break
 
         if idx % 512 == 0:
             # Save report checkpoint
@@ -2234,67 +2335,70 @@ if args.run_inversion:
                     'test_bs': test_bs,
                 }, f)
 
-    # Consolidate stats
-    for report_entry in report.values():
-        for k, v in list(report_entry.items()):
-            if len(v) == 0:
-                del report_entry[k]
-            else:
-                report_entry[k] = torch.cat(v, dim=0)
+    if not args.inv_export_demo_sample:
+        # Consolidate stats
+        for report_entry in report.values():
+            for k, v in list(report_entry.items()):
+                if len(v) == 0:
+                    del report_entry[k]
+                else:
+                    report_entry[k] = torch.cat(v, dim=0)
 
-    print()
-    print('Useful information:')
-    print('psnr_random: PSNR evaluated on novel views (in the test set, if available)')
-    print('ssim_random: SSIM evaluated on novel views (in the test set, if available)')
-    print('rot_error: rotation error in degrees (only reliable on synthetic datasets)')
-    print('fid_random: FID of selected split, evaluated against stats of train split')
-    print('fid_random_test: FID of selected split, evaluated against stats of test split')
-    print()
-    report_str_full = ''
-    for iter_num, report_entry in report.items():
-        report_str = f'[{iter_num} iterations]'
-        for elem in [
-                'psnr', 'psnr_random', 'lpips', 'lpips_random', 'ssim',
-                'ssim_random', 'iou', 'rot_error'
-        ]:
-            if elem in report_entry:
-                elem_val = report_entry[elem].mean().item()
-                report_str += f' {elem} {elem_val:.05f}'
-                report_entry[f'{elem}_avg'] = elem_val
-                writer.add_scalar(f'report/{elem}', elem_val, iter_num)
+        print()
+        print('Useful information:')
+        print('psnr_random: PSNR evaluated on novel views (in the test set, if available)')
+        print('ssim_random: SSIM evaluated on novel views (in the test set, if available)')
+        print('rot_error: rotation error in degrees (only reliable on synthetic datasets)')
+        print('fid_random: FID of selected split, evaluated against stats of train split')
+        print('fid_random_test: FID of selected split, evaluated against stats of test split')
+        print()
+        report_str_full = ''
+        for iter_num, report_entry in report.items():
+            report_str = f'[{iter_num} iterations]'
+            for elem in [
+                    'psnr', 'psnr_random', 'lpips', 'lpips_random', 'ssim',
+                    'ssim_random', 'iou', 'rot_error'
+            ]:
+                if elem in report_entry:
+                    elem_val = report_entry[elem].mean().item()
+                    report_str += f' {elem} {elem_val:.05f}'
+                    report_entry[f'{elem}_avg'] = elem_val
+                    writer.add_scalar(f'report/{elem}', elem_val, iter_num)
 
-        def add_inception_report(report_entry_key, tensorboard_key):
-            global report_str
-            if report_entry_key not in report_entry:
-                return None
-            fid_stats = fid.calculate_stats(
-                report_entry[report_entry_key].numpy())
-            fid_value = fid.calculate_frechet_distance(
-                *fid_stats, *train_eval_split.fid_stats)
-            report_entry[tensorboard_key] = fid_value
-            report_str += f' {tensorboard_key} {fid_value:.02f}'
-            del report_entry[report_entry_key]
-            writer.add_scalar(f'report/{tensorboard_key}', fid_value, iter_num)
-            if use_testset:
-                fid_test = fid.calculate_frechet_distance(
-                    *fid_stats, *test_split.fid_stats)
-                report_entry[tensorboard_key + '_test'] = fid_test
-                report_str += f' {tensorboard_key}_test {fid_test:.02f}'
-                writer.add_scalar(f'report/{tensorboard_key}_test', fid_test,
+            def add_inception_report(report_entry_key, tensorboard_key):
+                global report_str
+                if report_entry_key not in report_entry:
+                    return None
+                fid_stats = fid.calculate_stats(
+                    report_entry[report_entry_key].numpy())
+                fid_value = fid.calculate_frechet_distance(
+                    *fid_stats, *train_eval_split.fid_stats)
+                report_entry[tensorboard_key] = fid_value
+                report_str += f' {tensorboard_key} {fid_value:.02f}'
+                del report_entry[report_entry_key]
+                writer.add_scalar(f'report/{tensorboard_key}', fid_value,
                                   iter_num)
-            return fid_value
+                if use_testset:
+                    fid_test = fid.calculate_frechet_distance(
+                        *fid_stats, *test_split.fid_stats)
+                    report_entry[tensorboard_key + '_test'] = fid_test
+                    report_str += f' {tensorboard_key}_test {fid_test:.02f}'
+                    writer.add_scalar(f'report/{tensorboard_key}_test',
+                                      fid_test,
+                                      iter_num)
+                return fid_value
 
-        add_inception_report('inception_activations_front', 'fid_front')
-        fid_value = add_inception_report('inception_activations_random',
-                                         'fid_random')
+            add_inception_report('inception_activations_front', 'fid_front')
+            fid_value = add_inception_report('inception_activations_random',
+                                            'fid_random')
 
-        print(report_str)
-        report_str_full += report_str + '\n'
+            print(report_str)
+            report_str_full += report_str + '\n'
 
-    report_file_in = os.path.join(report_dir_effective, 'report')
-    with utils.open_file(report_file_in + '.pth', 'wb') as f:
-        torch.save(report, f)
-    with utils.open_file(report_file_in + '.txt', 'w') as f:
-        f.write(args.resume_from + '\n')
-        f.write(cfg_string + '\n')
-        f.write(report_str_full)
+        report_file_in = os.path.join(report_dir_effective, 'report')
+        with utils.open_file(report_file_in + '.pth', 'wb') as f:
+            torch.save(report, f)
+        with utils.open_file(report_file_in + '.txt', 'w') as f:
+            f.write(args.resume_from + '\n')
+            f.write(cfg_string + '\n')
+            f.write(report_str_full)

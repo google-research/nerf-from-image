@@ -376,6 +376,9 @@ class Generator(nn.Module):
         if use_viewdir:
             decoder_output_dim = 32
         elif attention_values > 0:
+            # We can efficiently implement the attention-based color mapping
+            # through a linear layer (matrix multiplication), since the
+            # queries are constant.
             decoder_output_dim = attention_values
         else:
             decoder_output_dim = 3

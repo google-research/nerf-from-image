@@ -547,10 +547,13 @@ class DiscriminatorMinibatchStd(nn.Module):
         self.num_channels = num_channels
 
     def forward(self, x):
-        _, nc, h, w = x.shape
+        bs, nc, h, w = x.shape
         ng = self.group_size
         f = self.num_channels
         nc //= f
+        
+        assert (bs % ng == 0,
+                'The batch size per GPU must be divisible by the group size')
 
         # Follows reference StyleGAN2 implementation
         y = x.reshape(ng, -1, f, nc, h, w)
